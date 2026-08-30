@@ -1,0 +1,1564 @@
+#!/usr/bin/env python3
+"""OpenSea eligibility Telegram bot — batch check main/vault/burner/vault_2/drain + aw1-aw100."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import httpx
+from eth_account import Account
+from eth_account.messages import encode_defunct
+
+# === CONFIG ===
+TOKEN_FILE = Path.home() / "credentials" / "os_elig_bot_token.txt"
+WALLETS_FILE = Path.home() / "credentials" / "addyjuuju.csv"
+PROXY_FILE = Path.home() / "credentials" / "proxies_geofast.txt"
+OPENSEA_API_KEY = "04704cf04094433789e9f0aed052e0d3"
+TELEGRAM_USER_ID = "1341231370"
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+SIWE_NONCE_URL = "https://opensea.io/__api/auth/siwe/nonce"
+SIWE_VERIFY_URL = "https://opensea.io/__api/auth/siwe/verify"
+GRAPHQL_URL = "https://gql.opensea.io/graphql"
+OPENSEA_API_V2_DROPS = "https://api.opensea.io/api/v2/drops"
+OPENSEA_API_V2_COLLECTIONS = "https://api.opensea.io/api/v2/collections"
+DROP_ELIGIBILITY_HASH = "d893f026d731e8f14986921fa4229098e018289f6cc7683f8ee2dd83749dd95d"
+SCATTER_TRPC = "https://www.scatter.art/api/trpc"
+RH_RPC = "https://rpc.mainnet.chain.robinhood.com"
+ZERO_BYTES32 = "0" * 64
+
+WORKERS = 100
+PROGRESS_EVERY = 10
+SIWE_RETRIES = 3
+SIWE_BACKOFF = 0.6
+SIWE_TIMEOUT = 10        # per-request timeout inside a lane (was 30)
+HEDGE_DELAY = 5.0        # launch 2nd lane if 1st hasn't finished
+LANE_TIMEOUT = 12.0      # hard cap per wallet across all lanes
+WALLET_GAP = 0.0
+MAX_RETRY_ROUNDS = 3
+RETRY_GAP = 0.25
+SIWE_CONCURRENCY = 100  # raised after proxy load if enough proxies
+PROBE_TIMEOUT = 4.0      # proxy health probe timeout
+SCREEN_TTL = 600         # re-screen proxies every 10 min (background)
+SESSION_TTL = 2700       # reuse SIWE session for 45 min (skip re-login)
+WIB = timezone(timedelta(hours=7))
+
+_running = False
+_progress_lock = threading.Lock()
+_siwe_gate = threading.Semaphore(SIWE_CONCURRENCY)
+_proxy_lock = threading.Lock()
+_proxy_idx = 0
+_PROXIES: list[str] = []
+_eth_usd_cache: dict = {"price": None, "at": 0.0}
+
+
+def load_token() -> str:
+    return TOKEN_FILE.read_text().strip()
+
+
+SPECIAL_ORDER = {"main": 0, "vault": 1, "burner": 2, "vault_2": 3, "drain": 4}
+
+
+def _parse_proxy_line(line: str) -> str | None:
+    """host:port:user:pass → http://user:pass@host:port"""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if "://" in line:
+        return line
+    parts = line.split(":")
+    if len(parts) == 4:
+        host, port, user, pw = parts
+        return f"http://{user}:{pw}@{host}:{port}"
+    if len(parts) == 2:
+        host, port = parts
+        return f"http://{host}:{port}"
+    return None
+
+
+def load_proxies() -> list[str]:
+    global _PROXIES, _siwe_gate, SIWE_CONCURRENCY
+    out: list[str] = []
+    if PROXY_FILE.exists():
+        for line in PROXY_FILE.read_text().splitlines():
+            p = _parse_proxy_line(line)
+            if p:
+                out.append(p)
+    _PROXIES = out
+    # With proxies, SIWE can run more concurrent (rate-limit is per-IP).
+    # Without proxies, keep serial to avoid 429 storm.
+    if out:
+        SIWE_CONCURRENCY = min(200, max(4, len(out) * 2))
+    else:
+        SIWE_CONCURRENCY = 2
+    _siwe_gate = threading.Semaphore(SIWE_CONCURRENCY)
+    return out
+
+
+def get_eth_usd() -> float | None:
+    """Cached ETH/USD. Coinbase first, CoinGecko fallback. 5 min TTL."""
+    now = time.time()
+    if _eth_usd_cache["price"] is not None and (now - _eth_usd_cache["at"]) < 300:
+        return _eth_usd_cache["price"]
+    urls = [
+        ("https://api.coinbase.com/v2/prices/ETH-USD/spot", lambda d: float(d["data"]["amount"])),
+        (
+            "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
+            lambda d: float(d["ethereum"]["usd"]),
+        ),
+    ]
+    for url, extract in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            px = extract(data)
+            if px > 0:
+                _eth_usd_cache["price"] = px
+                _eth_usd_cache["at"] = now
+                return px
+        except Exception:
+            continue
+    return _eth_usd_cache["price"]
+
+
+def next_proxy() -> str | None:
+    """Round-robin proxy. None if no proxies loaded."""
+    global _proxy_idx
+    if not _PROXIES:
+        return None
+    with _proxy_lock:
+        p = _PROXIES[_proxy_idx % len(_PROXIES)]
+        _proxy_idx += 1
+        return p
+
+
+# --- proxy screening (added Aug 15 2026) ---
+_screen_at = 0.0
+_screen_busy = threading.Lock()
+
+
+def _probe_proxy(proxy: str):
+    t0 = time.time()
+    try:
+        with httpx.Client(proxy=proxy, timeout=PROBE_TIMEOUT, headers={"User-Agent": UA}) as c:
+            c.get(SIWE_NONCE_URL)
+        return (time.time() - t0, proxy)
+    except Exception:
+        return (None, proxy)
+
+
+def screen_proxies(verbose: bool = True) -> int:
+    """Latency-probe all proxies in parallel; keep healthy ones, fastest first."""
+    global _PROXIES, _screen_at, _proxy_idx
+    if not _screen_busy.acquire(blocking=False):
+        return -1  # another screen in progress
+    try:
+        candidates = list(_PROXIES)
+        if not candidates:
+            return 0
+        with ThreadPoolExecutor(max_workers=min(200, len(candidates))) as ex:
+            results = list(ex.map(_probe_proxy, candidates))
+        healthy = sorted((lat, p) for lat, p in results if lat is not None)
+        with _proxy_lock:
+            if healthy:
+                _PROXIES = [p for _, p in healthy]
+                _proxy_idx = 0
+            _screen_at = time.time()
+        if verbose:
+            lats = [lat for lat, _ in healthy]
+            avg = sum(lats) / len(lats) if lats else 0.0
+            print(f"Proxy screen: {len(healthy)}/{len(candidates)} healthy | avg {avg*1000:.0f}ms", flush=True)
+        return len(healthy)
+    finally:
+        _screen_busy.release()
+
+
+def maybe_refresh_screen():
+    """Background re-screen when stale (never blocks a check)."""
+    if _PROXIES and time.time() - _screen_at > SCREEN_TTL:
+        threading.Thread(target=screen_proxies, daemon=True).start()
+
+
+# --- SIWE session cache: skip re-login on repeat checks within TTL ---
+_session_cache: dict = {}
+_session_cache_lock = threading.Lock()
+
+
+def _cache_session(address: str, client: httpx.Client):
+    try:
+        cookies = {c.name: c.value for c in client.cookies.jar}
+    except Exception:
+        return
+    if "access_token" not in str(cookies):
+        return
+    with _session_cache_lock:
+        _session_cache[address.lower()] = {"cookies": cookies, "ts": time.time()}
+
+
+def _evict_session(address: str):
+    with _session_cache_lock:
+        _session_cache.pop(address.lower(), None)
+
+
+def _reuse_session(address: str, proxy: str | None) -> httpx.Client | None:
+    with _session_cache_lock:
+        ent = _session_cache.get(address.lower())
+        if not ent or time.time() - ent["ts"] > SESSION_TTL:
+            return None
+        cookies = dict(ent["cookies"])
+    kwargs = {"timeout": SIWE_TIMEOUT, "follow_redirects": True, "headers": {"User-Agent": UA}}
+    if proxy:
+        kwargs["proxy"] = proxy
+    c = httpx.Client(**kwargs)
+    for k, v in cookies.items():
+        try:
+            c.cookies.set(k, v, domain="opensea.io")
+        except Exception:
+            pass
+    return c
+
+
+# --- hedged check: race up to 2 lanes (different proxies) per wallet ---
+_lane_pool: ThreadPoolExecutor | None = None
+
+
+def _get_lane_pool() -> ThreadPoolExecutor:
+    global _lane_pool
+    if _lane_pool is None:
+        _lane_pool = ThreadPoolExecutor(max_workers=240, thread_name_prefix="lane")
+    return _lane_pool
+
+
+def raced_check(w: dict, slug: str, api_stages: list) -> dict:
+    """Run check_one_wallet; if the first lane is slow, race a second lane on
+    another proxy. First clean result wins. Hard cap LANE_TIMEOUT per wallet."""
+    pool = _get_lane_pool()
+    t0 = time.time()
+    lanes = [pool.submit(check_one_wallet, w, slug, api_stages)]
+    hedged = False
+    last_err = None
+    while True:
+        remaining = LANE_TIMEOUT - (time.time() - t0)
+        if remaining <= 0:
+            return {"name": w.get("name", "?"), "error": last_err or "lane timeout",
+                    "eligible_labels": [], "public_labels": [], "public_only": False, "wallet": w}
+        slice_t = remaining if hedged else min(HEDGE_DELAY, remaining)
+        done, _ = wait(lanes, timeout=slice_t, return_when=FIRST_COMPLETED)
+        for fut in done:
+            lanes.remove(fut)
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = {"name": w.get("name", "?"), "error": str(e)[:80], "wallet": w}
+            if isinstance(res, dict) and not res.get("error"):
+                return res
+            last_err = res.get("error") if isinstance(res, dict) else str(res)
+        if lanes:
+            if not hedged and (time.time() - t0) >= HEDGE_DELAY:
+                lanes.append(pool.submit(check_one_wallet, w, slug, api_stages))
+                hedged = True
+            continue
+        # all lanes failed — one fresh lane if budget allows
+        if not hedged and (time.time() - t0) < LANE_TIMEOUT - 3.0:
+            lanes.append(pool.submit(check_one_wallet, w, slug, api_stages))
+            hedged = True
+            continue
+        return {"name": w.get("name", "?"), "error": last_err or "all lanes failed",
+                "eligible_labels": [], "public_labels": [], "public_only": False, "wallet": w}
+
+
+def load_aw_wallets() -> list[dict]:
+    """Load aw1-aw100 + main/vault/burner/vault_2/drain (PK required)."""
+    rows = []
+    with open(WALLETS_FILE) as f:
+        next(f, None)
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) < 3:
+                continue
+            name, addr, pk = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            key = name.lower()
+            if not pk or not pk.startswith("0x") or len(pk) != 66:
+                continue
+            if not addr.startswith("0x") or len(addr) != 42:
+                continue
+            m = re.fullmatch(r"aw(\d+)", key)
+            if m:
+                n = int(m.group(1))
+                if n < 1 or n > 100:
+                    continue
+                rows.append({"name": key, "address": addr, "pk": pk, "n": 100 + n})
+                continue
+            if key in SPECIAL_ORDER:
+                rows.append({"name": key, "address": addr, "pk": pk, "n": SPECIAL_ORDER[key]})
+    rows.sort(key=lambda x: x["n"])
+    return rows
+
+
+def parse_slug(text: str) -> str | None:
+    """OpenSea slug only (legacy helper)."""
+    link = parse_link(text)
+    if link and link["source"] == "opensea":
+        return link["slug"]
+    return None
+
+
+def parse_link(text: str) -> dict | None:
+    """Parse OpenSea or Scatter collection link.
+    Returns {source: 'opensea'|'scatter', slug: str} or None.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    raw = text.split("?")[0].split("#")[0].strip().rstrip("/")
+    m = re.search(r"scatter\.art/c/([A-Za-z0-9_-]+)", raw, re.I)
+    if m:
+        return {"source": "scatter", "slug": m.group(1)}
+    m = re.search(r"opensea\.io/(?:collection|drops)/([A-Za-z0-9_-]+)", raw, re.I)
+    if m:
+        return {"source": "opensea", "slug": m.group(1)}
+    # bare slug → default OpenSea (existing behaviour)
+    if re.fullmatch(r"[A-Za-z0-9_-]{2,80}", raw) and " " not in raw and not raw.startswith("/"):
+        return {"source": "opensea", "slug": raw}
+    return None
+
+
+def tg_api(method: str, payload: dict | None = None) -> dict:
+    token = load_token()
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if payload is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")[:300]
+        return {"ok": False, "error": f"HTTP {e.code}: {body}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def tg_send(chat_id, text, reply_to=None):
+    """Send message(s). Returns first message_id (or None)."""
+    # Telegram 4096 cap — split if needed
+    chunks = []
+    while text:
+        if len(text) <= 4000:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n", 0, 4000)
+        if cut < 1000:
+            cut = 4000
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    first_mid = None
+    for i, chunk in enumerate(chunks):
+        payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        if reply_to and i == 0:
+            payload["reply_to_message_id"] = reply_to
+        res = tg_api("sendMessage", payload)
+        if i == 0 and isinstance(res, dict) and res.get("ok"):
+            try:
+                first_mid = res["result"]["message_id"]
+            except Exception:
+                first_mid = None
+    return first_mid
+
+
+def tg_edit(chat_id, message_id, text) -> bool:
+    """Edit existing message. Truncate hard to 4096. Returns ok bool."""
+    if not message_id:
+        return False
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
+    res = tg_api("editMessageText", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    })
+    if isinstance(res, dict) and res.get("ok"):
+        return True
+    # ignore "message is not modified"
+    err = str((res or {}).get("error") or "")
+    if "not modified" in err.lower():
+        return True
+    return False
+
+
+def as_dict(x) -> dict:
+    return x if isinstance(x, dict) else {}
+
+
+def as_stage_list(stages) -> list[dict]:
+    if not isinstance(stages, list):
+        return []
+    return [s for s in stages if isinstance(s, dict)]
+
+
+def set_bot_commands():
+    tg_api("setMyCommands", {
+        "commands": [
+            {"command": "start", "description": "Start bot"},
+            {"command": "help", "description": "Cara pakai"},
+            {"command": "status", "description": "Status wallet"},
+        ]
+    })
+
+
+def fetch_drop_stages(slug: str) -> dict:
+    try:
+        r = httpx.get(
+            f"{OPENSEA_API_V2_DROPS}/{slug}",
+            headers={"X-API-KEY": OPENSEA_API_KEY, "User-Agent": UA},
+            timeout=20,
+        )
+        if r.status_code == 404:
+            return {"error": "drop_not_found"}
+        if r.status_code == 401:
+            return {"error": "api_key_invalid"}
+        if r.status_code != 200:
+            return {"error": f"http_{r.status_code}"}
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
+def fetch_collection_meta(slug: str) -> dict:
+    try:
+        r = httpx.get(
+            f"{OPENSEA_API_V2_COLLECTIONS}/{slug}",
+            headers={"X-API-KEY": OPENSEA_API_KEY, "User-Agent": UA},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return {"error": f"http_{r.status_code}"}
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
+# === SCATTER ===
+def _keccak_sel(sig: str) -> str:
+    # first 4 bytes of keccak256(sig)
+    try:
+        from eth_utils import keccak
+        return "0x" + keccak(text=sig)[:4].hex()
+    except Exception:
+        # minimal fallback via pycryptodome if present
+        import hashlib
+        # wrong but shouldn't hit; eth_utils is dep of eth_account already used
+        raise
+
+
+def scatter_trpc(proc: str, payload: dict) -> dict:
+    import urllib.parse
+    inp = urllib.parse.quote(json.dumps({"0": {"json": payload}}))
+    url = f"{SCATTER_TRPC}/{proc}?batch=1&input={inp}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": UA, "Accept": "application/json", "Origin": "https://www.scatter.art"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    return data[0]["result"]["data"]["json"]
+
+
+def rh_eth_call(to: str, data: str, rpc: str = RH_RPC) -> bytes:
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{"to": to, "data": data}, "latest"],
+    }).encode()
+    req = urllib.request.Request(
+        rpc,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": UA},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        res = json.loads(resp.read())
+    if "error" in res:
+        raise RuntimeError(str(res["error"])[:160])
+    raw = res.get("result") or "0x"
+    return bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+
+
+def scatter_decode_invites(raw: bytes) -> dict:
+    words = [int.from_bytes(raw[i:i + 32], "big") for i in range(0, len(raw), 32)]
+    while len(words) < 11:
+        words.append(0)
+    price, reserve, delta, start, end, limit, max_supply, interval, unit_size, token, is_bl = words[:11]
+    return {
+        "price_wei": price,
+        "price_eth": price / 1e18,
+        "reserve_wei": reserve,
+        "delta": delta,
+        "start": start,
+        "end": end,
+        "limit": limit,
+        "max_supply": max_supply,
+        "interval": interval,
+        "unit_size": unit_size,
+        "token": hex(token),
+        "is_blacklist": bool(is_bl),
+    }
+
+
+def scatter_list_supply(ca: str, key_hex: str) -> int:
+    data = _keccak_sel("listSupply(bytes32)") + key_hex
+    return int.from_bytes(rh_eth_call(ca, data), "big")
+
+
+def scatter_minted(ca: str, wallet: str, key_hex: str) -> int:
+    data = (
+        _keccak_sel("minted(address,bytes32)")
+        + wallet[2:].lower().rjust(64, "0")
+        + key_hex
+    )
+    return int.from_bytes(rh_eth_call(ca, data), "big")
+
+
+def scatter_balance(ca: str, wallet: str) -> int:
+    data = _keccak_sel("balanceOf(address)") + wallet[2:].lower().rjust(64, "0")
+    return int.from_bytes(rh_eth_call(ca, data), "big")
+
+
+def scatter_fetch_collection(slug: str) -> dict:
+    col = scatter_trpc("collection.getCollection", {"collectionSlug": slug})
+    ca = col.get("address")
+    if not ca:
+        raise RuntimeError("scatter collection has no address")
+    # charm root from activity (if any)
+    charm_roots: list[str] = []
+    try:
+        act = scatter_trpc("collection.getMintActivity", {"collectionId": col.get("id")})
+        for r in act.get("charmRoots") or []:
+            if isinstance(r, str) and r.startswith("0x") and len(r) == 66:
+                charm_roots.append(r.lower())
+    except Exception:
+        pass
+    # unique preserve order
+    seen = set()
+    roots = []
+    for r in charm_roots:
+        if r not in seen:
+            seen.add(r)
+            roots.append(r)
+
+    stages = []
+    # Public list = key 0x0
+    try:
+        inv = scatter_decode_invites(
+            rh_eth_call(ca, _keccak_sel("invites(bytes32)") + ZERO_BYTES32)
+        )
+        if inv["price_wei"] or inv["start"] or inv["limit"]:
+            stages.append({
+                "key": ZERO_BYTES32,
+                "label": "Public",
+                "kind": "public",
+                "price_wei": inv["price_wei"],
+                "limit": inv["limit"],
+                "max_supply": inv["max_supply"],
+                "start": inv["start"],
+                "end": inv["end"],
+                "minted_list": scatter_list_supply(ca, ZERO_BYTES32),
+            })
+    except Exception as e:
+        stages.append({"label": "Public", "kind": "public", "error": str(e)[:80]})
+
+    # Charm / list roots
+    for i, root in enumerate(roots):
+        key_hex = root[2:] if root.startswith("0x") else root
+        try:
+            inv = scatter_decode_invites(
+                rh_eth_call(ca, _keccak_sel("invites(bytes32)") + key_hex)
+            )
+            stages.append({
+                "key": key_hex,
+                "root": root,
+                "label": "Charm list" if i == 0 else f"List {i+1}",
+                "kind": "charm",
+                "price_wei": inv["price_wei"],
+                "limit": inv["limit"],
+                "max_supply": inv["max_supply"],
+                "start": inv["start"],
+                "end": inv["end"],
+                "minted_list": scatter_list_supply(ca, key_hex),
+            })
+        except Exception as e:
+            stages.append({"label": f"List {i+1}", "kind": "charm", "error": str(e)[:80]})
+
+    # UI discount stage (not always separate onchain key) — note only
+    try:
+        ts = int.from_bytes(rh_eth_call(ca, _keccak_sel("totalSupply()")), "big")
+    except Exception:
+        ts = col.get("num_items")
+
+    return {
+        "name": col.get("name") or slug,
+        "slug": col.get("slug") or slug,
+        "id": col.get("id"),
+        "address": ca,
+        "chain_id": col.get("chain_id") or col.get("chain") or 4663,
+        "max_items": col.get("max_items"),
+        "num_items": col.get("num_items") or ts,
+        "total_supply": ts,
+        "twitter": col.get("twitter") or "",
+        "website": col.get("website") or "",
+        "opensea_slug": col.get("opensea_slug") or "",
+        "stages": stages,
+        "has_mintable_list": col.get("has_mintable_list"),
+        "main_list": col.get("main_list"),
+    }
+
+
+def fmt_scatter_stages(info: dict) -> str:
+    lines = []
+    stages = info.get("stages") or []
+    if not stages:
+        lines.append("no onchain lists detected")
+        return "\n".join(lines)
+    eth_usd = get_eth_usd()
+    for i, s in enumerate(stages, 1):
+        if s.get("error"):
+            lines.append(f"{i}. {s.get('label','?')}: {s['error']}")
+            continue
+        price = s.get("price_wei") or 0
+        price_s = fmt_price(price, eth_usd)
+        lim = s.get("limit")
+        if lim in (None, 0, 2**32 - 1, 4294967295):
+            lim_s = "unlimited"
+        else:
+            lim_s = str(lim)
+        ms = s.get("max_supply")
+        if ms in (None, 0, 2**32 - 1, 4294967295):
+            ms_s = "∞"
+        else:
+            ms_s = str(ms)
+        minted = s.get("minted_list")
+        minted_s = str(minted) if minted is not None else "?"
+        kind = s.get("kind")
+        note = ""
+        if kind == "public":
+            note = " · all wallets"
+        elif kind == "charm":
+            note = " · merkle proof needed"
+        lines.append(f"{i}. {s.get('label','?')}{note}")
+        lines.append(f"   {price_s} · limit {lim_s}/wallet · list minted {minted_s}/{ms_s}")
+        if i < len(stages):
+            lines.append("")
+    return "\n".join(lines)
+
+
+def check_one_wallet_scatter(w: dict, info: dict) -> dict:
+    """Public = eligible for all. Charm = only if already minted on that list (proof unknown)."""
+    name, addr = w["name"], w["address"]
+    ca = info["address"]
+    try:
+        bal = scatter_balance(ca, addr)
+        eligible_labels = []
+        public_only = False
+        for s in info.get("stages") or []:
+            if s.get("error") or not s.get("key"):
+                continue
+            kind = s.get("kind")
+            label = s.get("label") or kind or "?"
+            key = s["key"]
+            if kind == "public":
+                # open list
+                public_only = True
+                # still count if already minted public
+                try:
+                    m = scatter_minted(ca, addr, key)
+                except Exception:
+                    m = 0
+                # public elig = everyone; we put under public_only, not ELIGIBLE map
+                continue
+            if kind == "charm":
+                try:
+                    m = scatter_minted(ca, addr, key)
+                except Exception:
+                    m = 0
+                if m > 0:
+                    eligible_labels.append(f"{label} (minted {m})")
+        # If no charm hits and public exists → public_only
+        if not eligible_labels and any(s.get("kind") == "public" for s in (info.get("stages") or [])):
+            public_only = True
+        return {
+            "name": name,
+            "eligible_labels": eligible_labels,
+            "public_only": public_only,
+            "error": None,
+            "wallet": w,
+            "balance": bal,
+        }
+    except Exception as e:
+        return {
+            "name": name,
+            "error": str(e)[:80],
+            "eligible_labels": [],
+            "public_only": False,
+            "wallet": w,
+        }
+
+
+def run_check_scatter(chat_id, msg_id, slug: str):
+    global _running
+    status_mid = None
+    try:
+        wallets = load_aw_wallets()
+        if not wallets:
+            # still allow address-only? keep same PK requirement as OS path
+            tg_send(chat_id, "No wallets with PK found", msg_id)
+            return
+        t0 = time.time()
+        status_mid = tg_send(chat_id, f"Checking Scatter {slug}\n{len(wallets)} wallets · RH onchain", msg_id)
+        info = as_dict(scatter_fetch_collection(slug))
+        coll_name = info.get("name") or slug
+        ca = info.get("address") or ""
+        header_lines = [
+            f"📦 {coll_name}",
+            f"https://www.scatter.art/c/{slug}",
+        ]
+        if info.get("opensea_slug"):
+            header_lines.append(f"https://opensea.io/collection/{info['opensea_slug']}")
+        if info.get("twitter"):
+            tw = info["twitter"]
+            if "x.com/" in tw or "twitter.com/" in tw:
+                header_lines.append(tw.replace("https://", "").replace("http://", ""))
+            else:
+                header_lines.append(f"x.com/{tw.lstrip('@')}")
+        header_lines.append(f"CA: {ca}")
+        header_lines.append(f"Chain: RH {info.get('chain_id', 4663)}")
+        header_lines.append(f"Supply: {info.get('total_supply') or info.get('num_items')}/{info.get('max_items') or '?'}")
+        header_lines.append("")
+        header_lines.append("Stages")
+        header_lines.append(fmt_scatter_stages(info))
+        header_lines.append("")
+        header_lines.append("Note: charm/list elig needs merkle proof (Scatter login).")
+        header_lines.append("Bot marks charm only if wallet already minted that list.")
+        header_lines.append("Public list = all wallets.")
+        header_text = "\n".join(header_lines)
+
+        def render(status: str, extra: list[str] | None = None) -> str:
+            parts = [header_text, "", status]
+            if extra:
+                parts.append("")
+                parts.extend(extra)
+            return "\n".join(parts)
+
+        if status_mid:
+            tg_edit(chat_id, status_mid, render(f"0/{len(wallets)}"))
+        else:
+            status_mid = tg_send(chat_id, render(f"0/{len(wallets)}"), msg_id)
+
+        eligible_map: dict[str, list[str]] = {}
+        public_only: list[str] = []
+        final_errors: list[str] = []
+        owned: list[str] = []
+        done_ok = 0
+        total = len(wallets)
+        for i, w in enumerate(wallets, 1):
+            res = check_one_wallet_scatter(w, info)
+            if not isinstance(res, dict):
+                final_errors.append(f"{w.get('name','?')}: bad result")
+            elif res.get("error"):
+                final_errors.append(f"{res.get('name','?')}: {res['error']}")
+            else:
+                done_ok += 1
+                apply_success(res, eligible_map, public_only)
+                if res.get("balance", 0) > 0:
+                    owned.append(f"{res['name']}×{res['balance']}")
+            if i % PROGRESS_EVERY == 0 or i == total:
+                hits = sum(len(set(v)) for v in eligible_map.values())
+                tg_edit(chat_id, status_mid, render(f"{i}/{total} · ok {done_ok} · charm hits {hits} · owned {len(owned)}"))
+
+        elapsed = time.time() - t0
+        extra = [
+            f"✅ {coll_name} (Scatter)",
+            f"{done_ok}/{total} ok · {fmt_elapsed(elapsed)}",
+            "",
+        ]
+        if owned:
+            extra.append(f"🖼 Owned · {len(owned)}")
+            extra.append(chunk_names(owned, 6))
+            extra.append("")
+        if eligible_map:
+            extra.append("🎯 CHARM / LIST (already minted)")
+            for label, names in eligible_map.items():
+                names_sorted = sorted(set(names), key=sort_wallet_name)
+                extra.append("")
+                extra.append(f"{label} · {len(names_sorted)}")
+                extra.append(chunk_names(names_sorted, 8))
+        else:
+            extra.append("🎯 CHARM / LIST (already minted)")
+            extra.append("none")
+        if public_only:
+            pass  # public open = all wallets, skip in report
+        if final_errors:
+            extra.append("")
+            extra.append(f"❌ Failed · {len(final_errors)}")
+            for e in final_errors[:40]:
+                extra.append(f"  {e}")
+        final_text = "\n".join([header_text, ""] + extra)
+        if not tg_edit(chat_id, status_mid, final_text):
+            tg_send(chat_id, final_text, msg_id)
+    except Exception as e:
+        try:
+            err = f"❌ Scatter error: {str(e)[:220]}"
+            if status_mid:
+                tg_edit(chat_id, status_mid, err)
+            else:
+                tg_send(chat_id, err)
+        except Exception:
+            pass
+        print(f"run_check_scatter fatal: {e}", flush=True)
+    finally:
+        _running = False
+
+
+def siwe_login(address: str, private_key: str) -> httpx.Client:
+    last_err = None
+    for attempt in range(1, SIWE_RETRIES + 1):
+        client = None
+        proxy = next_proxy()
+        try:
+            with _siwe_gate:
+                kwargs = {
+                    "timeout": SIWE_TIMEOUT,
+                    "follow_redirects": True,
+                    "headers": {"User-Agent": UA},
+                }
+                if proxy:
+                    kwargs["proxy"] = proxy
+                client = httpx.Client(**kwargs)
+                resp = client.post(SIWE_NONCE_URL)
+                if resp.status_code == 429:
+                    raise httpx.HTTPStatusError("429 nonce", request=resp.request, response=resp)
+                resp.raise_for_status()
+                nonce = resp.json()["nonce"]
+                issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                checksummed = Account.from_key(private_key).address
+                siwe_message = (
+                    f"opensea.io wants you to sign in with your Ethereum account:\n"
+                    f"{checksummed}\n\n"
+                    f"Click to sign in and accept the OpenSea Terms of Service "
+                    f"(https://opensea.io/tos) and Privacy Policy (https://opensea.io/privacy).\n\n"
+                    f"URI: https://opensea.io/\n"
+                    f"Version: 1\n"
+                    f"Chain ID: 1\n"
+                    f"Nonce: {nonce}\n"
+                    f"Issued At: {issued_at}"
+                )
+                msg_encoded = encode_defunct(text=siwe_message)
+                signed = Account.sign_message(msg_encoded, private_key=private_key)
+                signature = signed.signature.hex()
+                if not signature.startswith("0x"):
+                    signature = "0x" + signature
+                verify_body = {
+                    "message": {
+                        "domain": "opensea.io",
+                        "address": checksummed,
+                        "statement": "Click to sign in and accept the OpenSea Terms of Service (https://opensea.io/tos) and Privacy Policy (https://opensea.io/privacy).",
+                        "uri": "https://opensea.io/",
+                        "version": "1",
+                        "chainId": "1",
+                        "nonce": nonce,
+                        "issuedAt": issued_at,
+                        "accountType": "Ethereum",
+                    },
+                    "signature": signature,
+                    "chainArch": "EVM",
+                    "connectorId": "io.metamask",
+                }
+                resp = client.post(SIWE_VERIFY_URL, json=verify_body)
+                if resp.status_code == 429:
+                    raise httpx.HTTPStatusError("429 verify", request=resp.request, response=resp)
+                resp.raise_for_status()
+                has_token = any("access_token" in c.name for c in client.cookies.jar)
+                if not has_token:
+                    raise RuntimeError(f"no access_token cookie: {resp.text[:120]}")
+                client.cookies.set("connected-account-server-hint", checksummed, domain="opensea.io")
+                _cache_session(address, client)
+                return client
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            code = e.response.status_code if e.response is not None else 0
+            if code == 429 and attempt < SIWE_RETRIES:
+                # honor Retry-After if present; rotate proxy next loop
+                ra = 0.0
+                try:
+                    ra = float(e.response.headers.get("Retry-After") or 0)
+                except Exception:
+                    ra = 0.0
+                wait = max(ra, SIWE_BACKOFF * (2 ** (attempt - 1)))
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            if attempt < SIWE_RETRIES and ("429" in str(e) or "Too Many" in str(e)):
+                time.sleep(SIWE_BACKOFF * (2 ** (attempt - 1)))
+                continue
+            raise
+    raise RuntimeError(f"siwe_login failed after retries: {last_err}")
+
+
+def check_eligibility_graphql(client: httpx.Client, wallet: str, slug: str) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "x-app-id": "os2-web",
+        "x-graphql-operation-type": "query",
+        "accept": "*/*",
+        "origin": "https://opensea.io",
+        "referer": "https://opensea.io/",
+    }
+    body = {
+        "extensions": {"persistedQuery": {"sha256Hash": DROP_ELIGIBILITY_HASH, "version": 1}},
+        "operationName": "DropEligibilityQuery",
+        "variables": {"address": wallet, "collectionSlug": slug},
+    }
+    for attempt in range(1, SIWE_RETRIES + 1):
+        resp = client.post(GRAPHQL_URL, json=body, headers=headers)
+        if resp.status_code == 429:
+            if attempt < SIWE_RETRIES:
+                ra = 0.0
+                try:
+                    ra = float(resp.headers.get("Retry-After") or 0)
+                except Exception:
+                    ra = 0.0
+                time.sleep(max(ra, SIWE_BACKOFF * (2 ** (attempt - 1))))
+                continue
+            return {"error": "RATE_LIMITED"}
+        if resp.status_code in (401, 403):
+            return {"error": f"AUTH_FAILED ({resp.status_code})"}
+        if resp.status_code != 200:
+            return {"error": f"HTTP_{resp.status_code}"}
+        data = resp.json()
+        if "errors" in data:
+            err_msg = data["errors"][0].get("message", "")
+            if "PersistedQueryNotFound" in err_msg:
+                return {"error": "QUERY_HASH_EXPIRED"}
+            return {"error": f"GRAPHQL_ERROR: {err_msg[:120]}"}
+        return data.get("data", {})
+    return {"error": "RATE_LIMITED"}
+
+
+def parse_ts(val):
+    """Accept unix int/float or ISO string; return aware datetime or None."""
+    if val is None or val == "":
+        return None
+    try:
+        if isinstance(val, (int, float)):
+            return datetime.fromtimestamp(float(val), WIB)
+        s = str(val).strip()
+        if s.isdigit():
+            return datetime.fromtimestamp(int(s), WIB)
+        # ISO-ish
+        s2 = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(WIB)
+    except Exception:
+        return None
+
+
+def fmt_price(price, eth_usd: float | None = None) -> str:
+    if price is None or price == "":
+        return "-"
+    try:
+        # accept wei int, or already-eth float-ish string
+        if isinstance(price, float):
+            eth = price
+        else:
+            wei = int(price)
+            if wei == 0:
+                return "FREE"
+            eth = wei / 1e18
+        if eth == 0:
+            return "FREE"
+        if eth >= 1:
+            if eth == int(eth):
+                eth_s = f"{int(eth)} ETH"
+            else:
+                eth_s = f"{eth:.4f}".rstrip("0").rstrip(".") + " ETH"
+        else:
+            eth_s = f"{eth:.6f}".rstrip("0").rstrip(".") + " ETH"
+        if eth_usd is None:
+            eth_usd = get_eth_usd()
+        if eth_usd and eth > 0:
+            usd = eth * eth_usd
+            if usd >= 100:
+                usd_s = f"${usd:,.0f}"
+            elif usd >= 1:
+                usd_s = f"${usd:,.2f}"
+            else:
+                usd_s = f"${usd:.4f}".rstrip("0").rstrip(".")
+            return f"{eth_s} ({usd_s})"
+        return eth_s
+    except Exception:
+        return str(price)
+
+
+def fmt_stage_time(st, et) -> str:
+    if st and et:
+        return f"{st.strftime('%d %b %H:%M')} → {et.strftime('%d %b %H:%M')} WIB"
+    if st:
+        return f"start {st.strftime('%d %b %H:%M')} WIB"
+    if et:
+        return f"end {et.strftime('%d %b %H:%M')} WIB"
+    return "-"
+
+
+def sort_stages(stages: list) -> list:
+    stages = as_stage_list(stages)
+    def key(s):
+        st = parse_ts(s.get("start_time"))
+        if st is None:
+            return (1, datetime.max.replace(tzinfo=WIB))
+        return (0, st)
+    return sorted(stages, key=key)
+
+
+def fmt_stage_api(stages: list) -> str:
+    stages = as_stage_list(stages)
+    if not stages:
+        return "no stages"
+    ordered = sort_stages(list(stages))
+    eth_usd = get_eth_usd()
+    lines = []
+    for i, s in enumerate(ordered, 1):
+        label = s.get("label") or s.get("name") or f"Stage{i}"
+        price_s = fmt_price(s.get("price"), eth_usd)
+        mx = s.get("max_per_wallet")
+        mx_s = f"max {mx}" if mx not in (None, "") else "max -"
+        st = parse_ts(s.get("start_time"))
+        et = parse_ts(s.get("end_time"))
+        time_s = fmt_stage_time(st, et)
+        lines.append(f"{i}. {label}")
+        lines.append(f"   {price_s} · {mx_s}")
+        lines.append(f"   {time_s}")
+        if i < len(ordered):
+            lines.append("")
+    return "\n".join(lines)
+
+
+def chunk_names(names: list[str], per_line: int = 8) -> str:
+    if not names:
+        return "-"
+    rows = []
+    for i in range(0, len(names), per_line):
+        rows.append(", ".join(names[i:i + per_line]))
+    return "\n".join(rows)
+
+
+def map_stage_label(api_stages: list, idx: int, stage_type: str) -> str:
+    api_stages = as_stage_list(api_stages)
+    if api_stages and 0 <= idx < len(api_stages):
+        s = api_stages[idx]
+        return s.get("label") or s.get("name") or stage_type or f"Stage{idx}"
+    return stage_type or f"Stage{idx}"
+
+
+def check_one_wallet(w: dict, slug: str, api_stages: list) -> dict:
+    """SIWE + GraphQL for one wallet. Returns structured result."""
+    name, addr, pk = w["name"], w["address"], w["pk"]
+    client = None
+    try:
+        if WALLET_GAP > 0:
+            time.sleep(WALLET_GAP)
+        proxy = next_proxy()
+        client = _reuse_session(addr, proxy)
+        fresh_login = client is None
+        if fresh_login:
+            client = siwe_login(addr, pk)
+        data = check_eligibility_graphql(client, addr, slug)
+        if isinstance(data, dict) and str(data.get("error", "")).startswith("AUTH_FAILED") and not fresh_login:
+            # stale cached session — evict and re-login once
+            _evict_session(addr)
+            try:
+                client.close()
+            except Exception:
+                pass
+            client = siwe_login(addr, pk)
+            fresh_login = True
+            data = check_eligibility_graphql(client, addr, slug)
+        if isinstance(data, dict) and data.get("error") == "RATE_LIMITED":
+            time.sleep(1)
+            data = check_eligibility_graphql(client, addr, slug)
+        if isinstance(data, dict) and "error" in data:
+            return {"name": name, "error": data["error"], "wallet": w}
+
+        drop_data = as_dict(data.get("dropBySlug") or data.get("drop") or {})
+        stages = as_stage_list(drop_data.get("stages", []))
+        if not stages:
+            return {"name": name, "error": "no stages", "eligible_labels": [], "public_labels": [], "public_only": False, "wallet": w}
+
+        eligible_labels = []
+        public_labels = []
+        any_elig = False
+        for s in stages:
+            if not bool(s.get("isEligible")):
+                continue
+            any_elig = True
+            stage_type = s.get("stageType") or s.get("__typename") or "?"
+            idx = s.get("stageIndex", 0)
+            label = map_stage_label(api_stages, idx if isinstance(idx, int) else 0, stage_type)
+            is_public = "PUBLIC" in str(stage_type).upper() or str(label).upper() in ("PUBLIC", "PUBLIC SALE")
+            if is_public:
+                public_labels.append(label)
+            else:
+                eligible_labels.append(label)
+        return {
+            "name": name,
+            "eligible_labels": eligible_labels,
+            "public_labels": public_labels,
+            "public_only": bool(any_elig and not eligible_labels),
+            "error": None,
+            "wallet": w,
+        }
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "Too Many" in err:
+            err = "RATE_LIMITED_SIWE"
+        return {"name": name, "error": err[:80], "eligible_labels": [], "public_labels": [], "public_only": False, "wallet": w}
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+def sort_wallet_name(name: str) -> tuple:
+    m = re.search(r"(\d+)", name)
+    if name.startswith("aw") and m:
+        return (1, int(m.group(1)), name)
+    order = {"main": 0, "vault": 1, "burner": 2, "vault_2": 3, "drain": 4}
+    return (0, order.get(name, 99), name)
+
+
+def apply_success(res, eligible_map: dict, public_map):
+    name = res.get("name", "?")
+    for label in res.get("eligible_labels") or []:
+        eligible_map.setdefault(label, []).append(name)
+    pubs = res.get("public_labels")
+    if pubs:
+        for label in pubs:
+            if isinstance(public_map, dict):
+                public_map.setdefault(label, []).append(name)
+            else:
+                public_map.append(name)
+    elif res.get("public_only") and isinstance(public_map, list):
+        public_map.append(name)
+
+
+def dedupe_wallets(items: list[dict]) -> list[dict]:
+    seen = set()
+    out = []
+    for w in items:
+        name = w.get("name")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(w)
+    return out
+
+
+def run_wallet_pass(
+    wallets: list[dict],
+    slug: str,
+    api_stages: list,
+    parallel: bool,
+    progress_cb=None,
+) -> list[dict]:
+    """Run one pass. progress_cb(done, total, res) optional."""
+    results = []
+    if not wallets:
+        return results
+    total = len(wallets)
+    done = 0
+
+    def _handle(res):
+        nonlocal done
+        results.append(res)
+        done += 1
+        if progress_cb:
+            progress_cb(done, total, res)
+
+    if parallel and WORKERS > 1:
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {ex.submit(raced_check, w, slug, api_stages): w for w in wallets}
+            for fut in as_completed(futures):
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    w = futures[fut]
+                    res = {
+                        "name": w.get("name", "?"),
+                        "error": str(e)[:80],
+                        "eligible_labels": [],
+                        "public_only": False,
+                        "wallet": w,
+                    }
+                _handle(res)
+    else:
+        for w in wallets:
+            time.sleep(RETRY_GAP if not parallel else 0)
+            try:
+                res = raced_check(w, slug, api_stages)
+            except Exception as e:
+                res = {
+                    "name": w.get("name", "?"),
+                    "error": str(e)[:80],
+                    "eligible_labels": [],
+                    "public_only": False,
+                    "wallet": w,
+                }
+            _handle(res)
+    return results
+
+
+def fmt_elapsed(sec: float) -> str:
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    return f"{m}m {s:02d}s"
+
+
+def run_check(chat_id, msg_id, slug: str):
+    global _running
+    status_mid = None
+    try:
+        maybe_refresh_screen()
+        wallets = load_aw_wallets()
+        if not wallets:
+            tg_send(chat_id, "No wallets with PK found", msg_id)
+            return
+
+        t0 = time.time()
+        status_mid = tg_send(
+            chat_id,
+            f"Checking {slug}...",
+            msg_id,
+        )
+
+        drop = as_dict(fetch_drop_stages(slug))
+        coll = as_dict(fetch_collection_meta(slug))
+        coll_name = coll.get("name") or drop.get("name") or slug
+        twitter = coll.get("twitter_username") or ""
+        api_stages = as_stage_list(drop.get("stages", []) if "error" not in drop else [])
+
+        # Compact header: no stages section
+        header_lines = [
+            f"📦 {coll_name}",
+            f"https://opensea.io/collection/{slug}",
+        ]
+        if twitter:
+            header_lines.append(f"x.com/{twitter}")
+        header_text = "\n".join(header_lines)
+
+        total = len(wallets)
+        pct_step = 5  # update every 5%
+
+        def render_progress(pct: int) -> str:
+            return header_text + f"\n\n{pct}%"
+
+        def render_final(eligible_map, public_map, final_errors) -> str:
+            lines = [header_text, ""]
+            # ordered display list of non-public phases only (public = all wallets, skip)
+            display: list[tuple[str, bool]] = []
+            seen = set()
+            ordered = sort_stages(list(api_stages)) if api_stages else []
+            for s in ordered:
+                label = s.get("label") or s.get("name")
+                if not label or label in seen:
+                    continue
+                seen.add(label)
+                st = (s.get("stage_type") or "").lower()
+                if "public" in st:
+                    continue
+                display.append((label, False))
+            # result labels not in api stages (fallback stage_type / drop fetch fail)
+            for label in list(eligible_map) + [l for l in public_map if l not in eligible_map]:
+                if label not in seen:
+                    seen.add(label)
+                    display.append((label, False))
+            if not display:
+                lines.append("none")
+                lines.append("")
+            else:
+                for label, is_pub in display:
+                    disp = label
+                    pool = public_map.get(label, []) if is_pub else eligible_map.get(label, [])
+                    names_sorted = sorted(set(pool), key=sort_wallet_name)
+                    lines.append(f"{disp} · {len(names_sorted)}")
+                    if names_sorted:
+                        lines.append(chunk_names(names_sorted, 8))
+                    lines.append("")
+            elapsed = time.time() - t0
+            lines.append(f"✅ {fmt_elapsed(elapsed)}")
+            if final_errors:
+                lines.append(f"❌ {len(final_errors)} failed")
+            return "\n".join(lines)
+
+        if status_mid:
+            tg_edit(chat_id, status_mid, render_progress(0))
+
+        eligible_map: dict[str, list[str]] = {}
+        public_map: dict[str, list[str]] = {}
+        final_errors: list[str] = []
+        recovered_total = 0
+        done_ok = 0
+        pending = list(wallets)
+        failed: list[dict] = []
+
+        progress_lock = threading.Lock()
+        progress_done = 0
+        last_pct_reported = -1
+
+        def on_progress(done, tot, res):
+            nonlocal done_ok, progress_done, last_pct_reported
+            with progress_lock:
+                if not isinstance(res, dict):
+                    final_errors.append(f"?: bad result type {type(res).__name__}")
+                elif res.get("error"):
+                    w = res.get("wallet")
+                    if isinstance(w, dict):
+                        failed.append(w)
+                    else:
+                        final_errors.append(f"{res.get('name','?')}: {res['error']}")
+                else:
+                    apply_success(res, eligible_map, public_map)
+                    done_ok += 1
+                progress_done = done
+                pct = int(progress_done / tot * 100)
+                # snap to nearest pct_step
+                pct_snapped = (pct // pct_step) * pct_step
+                if pct_snapped != last_pct_reported and pct_snapped > 0:
+                    last_pct_reported = pct_snapped
+                    tg_edit(chat_id, status_mid, render_progress(pct_snapped))
+
+        run_wallet_pass(pending, slug, api_stages, parallel=True, progress_cb=on_progress)
+
+        # Auto-retry failures — PARALLEL (same worker pool as pass 1)
+        for rnd in range(1, MAX_RETRY_ROUNDS + 1):
+            pending = dedupe_wallets(failed)
+            if not pending:
+                break
+            failed = []
+            time.sleep(RETRY_GAP)
+            retry_results = run_wallet_pass(pending, slug, api_stages, parallel=True)
+            for res in retry_results:
+                if not isinstance(res, dict) or res.get("error"):
+                    w = res.get("wallet") if isinstance(res, dict) else None
+                    if isinstance(w, dict):
+                        failed.append(w)
+                        if rnd == MAX_RETRY_ROUNDS:
+                            final_errors.append(f"{w.get('name','?')}: FAILED")
+                    elif rnd == MAX_RETRY_ROUNDS:
+                        final_errors.append(f"{res.get('name','?') if isinstance(res, dict) else '?'}: FAILED")
+                else:
+                    apply_success(res, eligible_map, public_map)
+                    done_ok += 1
+                    recovered_total += 1
+
+        if failed:
+            have = {e.split(":", 1)[0].strip() for e in final_errors}
+            for w in failed:
+                n = w.get("name", "?")
+                if n not in have:
+                    final_errors.append(f"{n}: FAILED")
+
+        final_text = render_final(eligible_map, public_map, final_errors)
+        if not tg_edit(chat_id, status_mid, final_text):
+            tg_send(chat_id, final_text, msg_id)
+    except Exception as e:
+        try:
+            err = f"❌ Bot error: {str(e)[:200]}"
+            if status_mid:
+                tg_edit(chat_id, status_mid, err)
+            else:
+                tg_send(chat_id, err)
+        except Exception:
+            pass
+        print(f"run_check fatal: {e}", flush=True)
+    finally:
+        _running = False
+
+
+def parse_all_links(text: str) -> list[dict]:
+    """Extract all OS/Scatter URLs from a text block. Returns list of {source, slug}."""
+    results = []
+    seen = set()
+    # Match OS collection/drops URLs
+    for m in re.finditer(r'https?://(?:www\.)?opensea\.io/(?:collection|drops)/([A-Za-z0-9_-]+)', text):
+        slug = m.group(1).lower()
+        key = f"opensea:{slug}"
+        if key not in seen:
+            seen.add(key)
+            results.append({"source": "opensea", "slug": slug})
+    # Match Scatter URLs
+    for m in re.finditer(r'https?://(?:www\.)?scatter\.art/c/([A-Za-z0-9_-]+)', text):
+        slug = m.group(1).lower()
+        key = f"scatter:{slug}"
+        if key not in seen:
+            seen.add(key)
+            results.append({"source": "scatter", "slug": slug})
+    return results
+
+
+_queue_lock = threading.Lock()
+_check_queue: list[tuple] = []  # list of (chat_id, msg_id, source, slug)
+_queue_thread_running = False
+
+
+def _queue_worker():
+    global _running, _queue_thread_running
+    while True:
+        with _queue_lock:
+            if not _check_queue:
+                _queue_thread_running = False
+                _running = False
+                return
+            chat_id, msg_id, source, slug = _check_queue.pop(0)
+
+        _running = True
+        try:
+            if source == "scatter":
+                run_check_scatter(chat_id, msg_id, slug)
+            else:
+                run_check(chat_id, msg_id, slug)
+        except Exception as e:
+            print(f"queue worker error: {e}", flush=True)
+        finally:
+            _running = False
+
+
+def process_update(update: dict):
+    global _running, _queue_thread_running
+    msg = update.get("message") or {}
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    text = (msg.get("text") or "").strip()
+    msg_id = msg.get("message_id")
+    if chat_id != TELEGRAM_USER_ID:
+        return
+    if not text:
+        return
+
+    lower = text.lower()
+    if lower in ("/start", "/help"):
+        tg_send(chat_id, (
+            "🤖 Eligibility Bot\n\n"
+            "Cek elig main/vault/burner/vault_2/drain + aw1-aw100.\n\n"
+            "Kirim link OS atau Scatter — bisa sekaligus banyak.\n\n"
+            "/status — jumlah wallet"
+        ), msg_id)
+        return
+    if lower == "/status":
+        wallets = load_aw_wallets()
+        with _queue_lock:
+            qlen = len(_check_queue)
+        tg_send(
+            chat_id,
+            (
+                f"✅ Ready\n"
+                f"Wallets: {len(wallets)} (main/vault/burner/vault_2/drain + aw1-aw100)\n"
+                f"Workers: {WORKERS} | siwe×{SIWE_CONCURRENCY} | gap: {WALLET_GAP}s | proxy: {len(_PROXIES)}\n"
+                f"Queue: {qlen} pending\n"
+                f"Busy: {_running}"
+            ),
+            msg_id,
+        )
+        return
+    if text.startswith("/"):
+        tg_send(chat_id, "Unknown. Kirim link OS / Scatter. /help", msg_id)
+        return
+
+    # Try multi-link first
+    links = parse_all_links(text)
+    if not links:
+        # Fallback: try single bare slug
+        link = parse_link(text)
+        if not link:
+            tg_send(chat_id, "Kirim link OpenSea (collection/drops) atau Scatter (/c/slug).", msg_id)
+            return
+        links = [link]
+
+    with _queue_lock:
+        for lnk in links:
+            _check_queue.append((chat_id, msg_id, lnk["source"], lnk["slug"]))
+        qlen = len(_check_queue)
+        already_running = _queue_thread_running
+
+    if len(links) > 1:
+        tg_send(chat_id, f"📋 Queued {len(links)} collections. Processing...", msg_id)
+    
+    if not already_running:
+        with _queue_lock:
+            _queue_thread_running = True
+        threading.Thread(target=_queue_worker, daemon=True).start()
+
+
+def main():
+    print("OS Eligibility Telegram Bot started", flush=True)
+    set_bot_commands()
+    proxies = load_proxies()
+    if proxies:
+        screen_proxies(verbose=True)
+        proxies = _PROXIES
+    wallets = load_aw_wallets()
+    print(f"Loaded {len(wallets)} wallets | proxies={len(proxies)} | workers={WORKERS} siwe×{SIWE_CONCURRENCY} gap={WALLET_GAP} hedge@{HEDGE_DELAY}s cap={LANE_TIMEOUT}s sessionTTL={SESSION_TTL}s", flush=True)
+    offset = 0
+    while True:
+        try:
+            token = load_token()
+            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=30"
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=40) as resp:
+                data = json.loads(resp.read())
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                try:
+                    process_update(update)
+                except Exception as e:
+                    print(f"process error: {e}", flush=True)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"poll error: {e}", flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
